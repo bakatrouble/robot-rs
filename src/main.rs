@@ -91,7 +91,7 @@ impl S3 {
         match self.s3_client.objects()
             .put(self.s3_bucket.clone(), key)
             .content_type(content_type.as_ref())?
-            .content_disposition(format!("inline; filename=\"{}\"", disposition_filename))?
+            .content_disposition(format!("inline; filename=\"{disposition_filename}\""))?
             .body_bytes(bytes)
             .send().await {
             Ok(response) => {
@@ -173,7 +173,7 @@ async fn handle_media(bot: Bot, msg: Message, file: FileMeta, original_filename:
 
     match s3.put(key.as_str(), mime, buf, disposition_filename.as_str()).await {
         Ok(url) => {
-            let mut message_builder = bot.send_message::<ChatId, String>(msg.chat.id, url.clone().into())
+            let mut message_builder = bot.send_message(msg.chat.id, url.clone())
                 .disable_link_preview(true);
             if is_photo {
                 message_builder = message_builder
@@ -196,7 +196,7 @@ async fn handle_media(bot: Bot, msg: Message, file: FileMeta, original_filename:
         },
         Err(err) => {
             error!("S3 upload failed: {:?}", err);
-            bot.send_message::<ChatId, String>(msg.chat.id, format!("S3 upload failed: {}", err))
+            bot.send_message(msg.chat.id, format!("S3 upload failed: {}", err))
                 .disable_link_preview(true)
                 .reply_to(msg)
                 .await?;
