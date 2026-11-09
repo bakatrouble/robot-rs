@@ -3,9 +3,9 @@ use std::{
 };
 use std::path::Path;
 use clap::Parser;
-use cuid::cuid2;
 use log::error;
 use mime_guess::Mime;
+use ring::digest;
 use s3::{AddressingStyle, Auth, Client as S3Client, Credentials};
 use teloxide::{
     sugar::request::{RequestLinkPreviewExt, RequestReplyExt},
@@ -65,15 +65,38 @@ impl S3 {
         })
     }
 
-    pub async fn put(&self, filename: &str, content_type: Mime, bytes: Vec<u8>) -> Result<String, s3::Error> {
+    pub async fn exists(&self, key: &str) -> Result<bool, s3::Error> {
         match self.s3_client.objects()
-            .put(self.s3_bucket.clone(), filename.clone())
+            .head(self.s3_bucket.clone(), key)
+            .send().await {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                match err {
+                    s3::Error::Api(e) if e.status.as_u16() == 404 => Ok(false),
+                    _ => Err(err),
+                }
+            }
+        }
+    }
+
+    pub fn build_url(&self, key: &str) -> String {
+        format!("{}/{}/{key}", self.endpoint, self.s3_bucket)
+    }
+
+    pub async fn put(&self, key: &str, content_type: Mime, bytes: Vec<u8>, disposition_filename: &str) -> Result<String, s3::Error> {
+        if self.exists(key).await? {
+            return Ok(self.build_url(key));
+        }
+
+        match self.s3_client.objects()
+            .put(self.s3_bucket.clone(), key)
             .content_type(content_type.as_ref())?
+            .content_disposition(format!("inline; filename=\"{}\"", disposition_filename))?
             .body_bytes(bytes)
             .send().await {
             Ok(response) => {
                 println!("S3 upload etag: {}", response.etag.unwrap_or("<none>".to_string()));
-                Ok(format!("{}/{}/{}", self.endpoint, self.s3_bucket, filename.clone()))
+                Ok(self.build_url(key))
             },
             Err(err) => {
                 eprintln!("S3 upload error: {:?}", err);
@@ -97,22 +120,22 @@ async fn main() -> anyhow::Result<()> {
 
     let handler = Update::filter_message()
         .branch(Message::filter_audio().endpoint(|bot, msg, media: Audio, s3: Arc<S3>| async move {
-            handle_media(bot, msg, media.file, media.file_name.unwrap_or("a.mp3".into()), s3, false).await
+            handle_media(bot, msg, media.file, media.file_name, "a.mp3", s3, false).await
         }))
         .branch(Message::filter_photo().endpoint(|bot, msg, media: Vec<PhotoSize>, s3: Arc<S3>| async move {
-            handle_media(bot, msg, media.into_iter().last().unwrap().file, "a.jpg".into(), s3, true).await
+            handle_media(bot, msg, media.into_iter().last().unwrap().file, None, "a.jpg", s3, true).await
         }))
         .branch(Message::filter_video().endpoint(|bot, msg, media: Video, s3: Arc<S3>| async move {
-            handle_media(bot, msg, media.file, media.file_name.unwrap_or("a.mp4".into()), s3, false).await
+            handle_media(bot, msg, media.file, media.file_name, "a.mp4", s3, false).await
         }))
         .branch(Message::filter_document().endpoint(|bot, msg, media: Document, s3: Arc<S3>| async move {
-            handle_media(bot, msg, media.file, media.file_name.unwrap_or("".into()), s3, false).await
+            handle_media(bot, msg, media.file, media.file_name, "", s3, false).await
         }))
         .branch(Message::filter_voice().endpoint(|bot, msg, media: Voice, s3: Arc<S3>| async move {
-            handle_media(bot, msg, media.file, "a.ogg".into(), s3, false).await
+            handle_media(bot, msg, media.file, None, "a.ogg", s3, false).await
         }))
         .branch(Message::filter_video_note().endpoint(|bot, msg, media: VideoNote, s3: Arc<S3>| async move {
-            handle_media(bot, msg, media.file, "a.mp4".into(), s3, false).await
+            handle_media(bot, msg, media.file, None, "a.mp4", s3, false).await
         }));
 
     Dispatcher::builder(bot, handler)
@@ -125,19 +148,30 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_media(bot: Bot, msg: Message, file: FileMeta, filename: String, s3: Arc<S3>, is_photo: bool) -> anyhow::Result<()> {
-    let extension = Path::new(&filename).extension().and_then(|e| e.to_str());
-    let mut filename = cuid2();
-    if let Some(ext) = extension {
-        filename.push_str(format!(".{}", ext).as_str());
-    }
-    let mime = mime_guess::from_path(&filename).first_or_octet_stream();
+async fn handle_media(bot: Bot, msg: Message, file: FileMeta, original_filename: Option<String>, default_filename: &str, s3: Arc<S3>, is_photo: bool) -> anyhow::Result<()> {
+    let name_for_ext = original_filename.as_deref().unwrap_or(default_filename);
+    let extension = Path::new(name_for_ext).extension().and_then(|e| e.to_str());
+    let mime = mime_guess::from_path(name_for_ext).first_or_octet_stream();
 
     let file = bot.get_file(file.id).await?;
     let mut buf: Vec<u8> = vec![];
     bot.download_file(&file.path, &mut buf).await?;
 
-    match s3.put(filename.as_str(), mime, buf).await {
+    let mut key = hex::encode(digest::digest(&digest::SHA256, buf.as_ref()));
+    if let Some(ext) = extension {
+        key.push_str(format!(".{}", ext).as_str());
+    }
+
+    // Original sender filename, sanitized for use in Content-Disposition.
+    // Falls back to the key when Telegram provided no name.
+    let disposition_filename: String = original_filename
+        .as_deref()
+        .map(|name| Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(""))
+        .filter(|name| !name.is_empty())
+        .map(|name| name.replace('"', "_"))
+        .unwrap_or_else(|| key.clone());
+
+    match s3.put(key.as_str(), mime, buf, disposition_filename.as_str()).await {
         Ok(url) => {
             let mut message_builder = bot.send_message::<ChatId, String>(msg.chat.id, url.clone().into())
                 .disable_link_preview(true);
@@ -146,15 +180,15 @@ async fn handle_media(bot: Bot, msg: Message, file: FileMeta, filename: String, 
                     .reply_markup(InlineKeyboardMarkup::new(vec![vec![
                         InlineKeyboardButton::url(
                             "Google Lens",
-                            url::Url::parse(format!("https://lens.google.com/uploadbyurl?url={}", url).as_str())?
+                            Url::parse(format!("https://lens.google.com/uploadbyurl?url={}", url).as_str())?
                         ),
                         InlineKeyboardButton::url(
                             "Yandex IS",
-                            url::Url::parse(format!("https://yandex.ru/images/search?rpt=imageview&url={}", url).as_str())?
+                            Url::parse(format!("https://yandex.ru/images/search?rpt=imageview&url={}", url).as_str())?
                         ),
                         InlineKeyboardButton::url(
                             "SauceNao",
-                            url::Url::parse(format!("https://saucenao.com/search.php?url={}", url).as_str())?
+                            Url::parse(format!("https://saucenao.com/search.php?url={}", url).as_str())?
                         ),
                     ]]));
             }

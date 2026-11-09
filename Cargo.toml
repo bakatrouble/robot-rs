@@ -6,10 +6,11 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "env"] }
-cuid = { version = "2.0.4", features = ["v2"] }
+hex = "0.4.3"
 log = "0.4.35"
 mime_guess = "2.0.5"
 pretty_env_logger = "0.5.0"
+ring = "0.17.14"
 s3 = "0.1.38"
 teloxide = { version = "0.17.0", default-features = false, features = ["macros", "ctrlc_handler", "rustls", "rustls-native-roots"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
